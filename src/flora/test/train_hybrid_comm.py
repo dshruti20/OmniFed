@@ -46,12 +46,13 @@ class HybridTrainer(object):
         self.mpi2_addr = "127.0.0.1"
         self.mpi2_port = 28290
 
-        if torch.cuda.is_available():
+        # cpu only case
+        #if torch.cuda.is_available():
             # self.device = torch.device("cuda:" + str(self.global_rank))
-            dev_id = self.global_rank % 7
-            self.device = torch.device("cuda:" + str(dev_id))
-        else:
-            self.device = torch.device("cpu")
+            #dev_id = self.global_rank % 7
+            #self.device = torch.device("cuda:" + str(dev_id))
+        #else:
+        self.device = torch.device("cpu")
 
         logging.basicConfig(
             filename=self.logdir
@@ -211,10 +212,16 @@ class HybridTrainer(object):
 
                     # perform an MPI broadcast here next to distributed cross-facility aggregated model
                     # corresponds to processes with global_rank 1 and 2
-                    if self.local_rank == 0:
-                        self.model = self.mpi_comm.broadcast(
-                            msg=self.model, id=self.local_rank
-                        )
+                    #if self.local_rank == 0:
+                        #self.model = self.mpi_comm.broadcast(
+                            #msg=self.model, id=self.local_rank
+                        #)
+                    #new edit
+                    # MPI broadcast within each facility group:
+                    # local_rank 0 (global_rank 1 in group1, global_rank 2 in group2) is the root (src=0).
+                    # ALL ranks in that MPI group must participate.
+                    if self.global_rank != 0:
+                        self.model = self.mpi_comm.broadcast(msg=self.model, id=0)
 
                 logging.info(
                     f"training_metrics local_step: {self.local_step} compute_time {compute_time} ms "

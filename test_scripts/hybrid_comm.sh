@@ -19,7 +19,7 @@ cd ../
 # kill -s 9 `ps -ef | grep src.flora.test.launch_hybridcomm |grep -v grep | awk '{print $2}'`
 # kill -9 $(ps aux | grep src.flora.test.launch_hybridcomm | grep -v grep | awk '{print $2}')
 
-dir='/Users/ssq/Desktop/datasets/flora_test/'
+dir='/home/shruti/omnifed_data/flora_test/'
 #dir='/ccsopen/home/ssq/datasets/'
 bsz=32
 worldsize=7
