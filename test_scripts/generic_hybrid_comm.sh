@@ -11,7 +11,7 @@ cd "${REPO_ROOT}"
 # -----------------------
 usage() {
   echo "Usage: $0 --config <config_file_name>"
-  echo "Example: bash new_hybrid_comm_trapwait.sh --config try1_hybrid_topo.yaml"
+  echo "Example: bash generic_hybrid_comm.sh --config try1_hybrid_topo.yaml"
   exit 1
 }
 
@@ -33,25 +33,26 @@ if [[ -z "$CONFIG_FILE" ]]; then
   usage
 fi
 
-config="${REPO_ROOT}/config/${CONFIG_FILE}"
+topology_name="${CONFIG_FILE%.yaml}"
+hydra_topology_cfg="${REPO_ROOT}/conf_hybrid/topology/${topology_name}.yaml"
 
-if [[ ! -f "$config" ]]; then
-  echo "Error: Config file not found: $config"
+if [[ ! -f "$hydra_topology_cfg" ]]; then
+  echo "Error: Hydra topology config not found: $hydra_topology_cfg"
   exit 1
 fi
 
 # -----------------------
-# Read world_size from yaml
+# Read world_size from Hydra-composed config
 # -----------------------
-worldsize=$(grep -m 1 "world_size:" "$config" | awk '{print $2}')
+worldsize="$(python3 -u -m src.flora.test.hydra_world_size --config "${CONFIG_FILE}")"
 
 if [[ -z "$worldsize" ]]; then
-  echo "Error: Could not read world_size from $config"
+  echo "Error: Could not read world_size from Hydra config: $CONFIG_FILE"
   exit 1
 fi
 
-echo "Using config: $config"
-echo "World size from yaml: $worldsize"
+echo "Using Hydra topology config: $hydra_topology_cfg"
+echo "World size from Hydra config: $worldsize"
 
 # -----------------------
 # User-configurable params (hardcoded)
@@ -103,7 +104,7 @@ for ((globalrank=0; globalrank<worldsize; globalrank++)); do
   mkdir -p "${dir}/g${globalrank}"
 
   python3 -u -m src.flora.test.omega_launch_hybridcomm \
-    --config="${config}" \
+    --config="${CONFIG_FILE}" \
     --dir="${dir}" --bsz="${bsz}" --global-rank="${globalrank}" \
     --comm-freq="${commfreq}" --backend="${backend}" \
     --model="${model}" --dataset="${dataset}" \

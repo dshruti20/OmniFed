@@ -1,13 +1,13 @@
 import argparse
 
 import src.flora.helper as helper
-from omegaconf import OmegaConf
+from src.flora.test.hydra_hybrid_config import load_hybrid_cfg
 from src.flora.test.omega_train_hybrid_comm import HybridTrainer
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config/try1_hybrid_topo.yaml")
+    parser.add_argument("--config", type=str, default="try1_hybrid_topo.yaml")
 
     parser.add_argument(
         "--seed", type=int, default=1234, help="seed value for result replication"
@@ -42,7 +42,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    cfg = OmegaConf.load(args.config)
+    cfg = load_hybrid_cfg(args.config)
 
     helper.set_seed(args.seed, determinism=False)
     HybridTrainer(args=args, cfg=cfg).start_training()
