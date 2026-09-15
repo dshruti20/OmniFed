@@ -2,7 +2,8 @@
 # Centralized Topology with TorchDist Communication
 #
 # Traditional server-client federated learning topology.
-# One aggregator node coordinates multiple client nodes using PyTorch distributed backend.
+# One aggregator node coordinates multiple client nodes (gRPC).
+# For TorchDist all-reduce use topology: allreduce (world == num_clients, all train).
 # ================================================================================
 
 defaults:
