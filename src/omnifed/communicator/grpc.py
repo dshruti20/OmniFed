@@ -23,11 +23,18 @@ import torch
 from torch import nn
 from ..utils import print
 from ..utils import MetricLogger
-from . import BaseCommunicator, grpc_pb2_grpc
-from .base import AggregationOp
+from .base import AggregationOp, BaseCommunicator
+from . import grpc_pb2_grpc
 from .compression import resolve_compressor
 from .grpc_client import GrpcClient
 from .grpc_server import GrpcServer
+from .grpc_limits import (
+    GRPC_AGGREGATION_TIMEOUT_SEC,
+    GRPC_CHUNK_PAYLOAD_BYTES,
+    GRPC_CHUNK_THRESHOLD_BYTES,
+    GRPC_CLIENT_TIMEOUT_SEC,
+    GRPC_MAX_MESSAGE_BYTES,
+)
 from .utils import get_msg_info
 # from typing import override
 
@@ -50,10 +57,10 @@ class GrpcCommunicator(BaseCommunicator):
         master_addr: str = "127.0.0.1",
         master_port: int = 50051,
         max_workers: int = 10,
-        max_send_message_length: int = 104857600,  # 100 MB
-        max_receive_message_length: int = 104857600,  # 100 MB
-        aggregation_timeout: float = 600.0,
-        client_timeout: float = 60.0,
+        max_send_message_length: int = GRPC_MAX_MESSAGE_BYTES,
+        max_receive_message_length: int = GRPC_MAX_MESSAGE_BYTES,
+        aggregation_timeout: float = GRPC_AGGREGATION_TIMEOUT_SEC,
+        client_timeout: float = GRPC_CLIENT_TIMEOUT_SEC,
         retry_delay: float = 5.0,
         max_retries: int = 5,
         compressor=None,
@@ -62,6 +69,8 @@ class GrpcCommunicator(BaseCommunicator):
         communicate_params: bool = True,
         normalize_by_total_samples: bool = False,
         backend: object = None,
+        chunk_threshold_bytes: int = GRPC_CHUNK_THRESHOLD_BYTES,
+        chunk_payload_bytes: int = GRPC_CHUNK_PAYLOAD_BYTES,
         **kwargs: object,
     ) -> None:
         """
@@ -114,7 +123,10 @@ class GrpcCommunicator(BaseCommunicator):
         self.communicate_params = bool(communicate_params)
         self.normalize_by_total_samples = bool(normalize_by_total_samples)
         self._aggregation_num_samples = 0
+        self._aggregation_compress = False
         self._agg_device = torch.device("cpu")
+        self.chunk_threshold_bytes = int(chunk_threshold_bytes)
+        self.chunk_payload_bytes = int(chunk_payload_bytes)
 
     def set_agg_device(self, device: torch.device | str) -> None:
         """Wire resolver ``agg_device`` into client compress/decompress and server SUM."""
@@ -205,6 +217,8 @@ class GrpcCommunicator(BaseCommunicator):
                 communicate_params=self.communicate_params,
                 normalize_by_total_samples=self.normalize_by_total_samples,
                 agg_device=getattr(self, "_agg_device", torch.device("cpu")),
+                chunk_threshold_bytes=self.chunk_threshold_bytes,
+                chunk_payload_bytes=self.chunk_payload_bytes,
             )
             grpc_pb2_grpc.add_GrpcServerServicer_to_server(self._servicer, self._server)
 
@@ -224,6 +238,8 @@ class GrpcCommunicator(BaseCommunicator):
                 compressor=self.compressor,
                 communicate_params=self.communicate_params,
                 agg_device=getattr(self, "_agg_device", torch.device("cpu")),
+                chunk_threshold_bytes=self.chunk_threshold_bytes,
+                chunk_payload_bytes=self.chunk_payload_bytes,
             )
             if self.logger is not None:
                 self._client.set_logger(self.logger)
@@ -264,8 +280,12 @@ class GrpcCommunicator(BaseCommunicator):
             self._client.set_logger(logger)
 
     def set_aggregation_num_samples(self, num_samples: int) -> None:
-        """Sample count for the next ``aggregate()`` call (classic grad Path A/B)."""
+        """n_i for the next ``aggregate()`` (sample-weighted SUM)."""
         self._aggregation_num_samples = max(int(num_samples), 0)
+
+    def set_aggregation_compress(self, enabled: bool) -> None:
+        """Whether Top-K/QSGD applies on the next ``aggregate()``."""
+        self._aggregation_compress = bool(enabled)
 
     def aggregate(
         self,
@@ -285,15 +305,14 @@ class GrpcCommunicator(BaseCommunicator):
         Returns:
             Aggregated message with combined values from all ranks
         """
-        # Extract tensors and perform distributed aggregation
-        tensordict = self._extract_tensordict_from_msg(msg)
-        print(f"{get_msg_info(msg)} | reduction={reduction}")
-
-        # Perform aggregation via gRPC protocol
-        aggregated_tensordict = self._grpc_aggregate(tensordict, reduction)
-
-        # Apply aggregated results back to original message format
-        return self._apply_tensordict_to_msg(msg, aggregated_tensordict)
+        try:
+            tensordict = self._extract_tensordict_from_msg(msg)
+            print(f"{get_msg_info(msg)} | reduction={reduction}")
+            aggregated_tensordict = self._grpc_aggregate(tensordict, reduction)
+            return self._apply_tensordict_to_msg(msg, aggregated_tensordict)
+        finally:
+            self._aggregation_num_samples = 0
+            self._aggregation_compress = False
 
     def _extract_tensordict_from_msg(
         self,
@@ -410,6 +429,7 @@ class GrpcCommunicator(BaseCommunicator):
                 tensordict,
                 reduction,
                 num_samples=self._aggregation_num_samples,
+                compress=self._aggregation_compress,
             ):
                 raise RuntimeError(
                     "gRPC aggregation submit failed (see server log for session errors)"
@@ -447,8 +467,13 @@ class GrpcCommunicator(BaseCommunicator):
                 payload = tensordict
             else:
                 payload = tensordict
+            if self._aggregation_compress:
+                session_state["compress_result"] = True
             self.servicer._accumulate_into_session(
-                session_state, "server", payload
+                session_state,
+                "server",
+                payload,
+                num_samples=int(self._aggregation_num_samples),
             )
             session_state["total_samples"] = int(
                 session_state.get("total_samples", 0)

@@ -26,6 +26,13 @@ import torch
 from ..utils import print
 from . import grpc_pb2, grpc_pb2_grpc
 from .base import AggregationOp
+from .grpc_chunking import (
+    assemble_payload_chunks,
+    chunk_count,
+    iter_payload_chunks,
+    should_chunk_payload,
+)
+from .grpc_limits import GRPC_CHUNK_PAYLOAD_BYTES, GRPC_CHUNK_THRESHOLD_BYTES
 from .utils import get_msg_info, proto_to_tensordict, tensordict_to_proto, proto_to_tensordict_extended
 from .utils import (
     aggregation_metric_for_communicate_params,
@@ -53,6 +60,8 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
         communicate_params: bool = True,
         normalize_by_total_samples: bool = False,
         agg_device: torch.device | str | None = None,
+        chunk_threshold_bytes: int | None = None,
+        chunk_payload_bytes: int | None = None,
     ):
         """
         Initialize gRPC server for federated learning coordination.
@@ -60,8 +69,8 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
         Args:
             world_size: Total number of FL participants (including server)
             communicate_params: Aggregate model parameters when True, else gradients
-            normalize_by_total_samples: After SUM, divide by summed client ``num_samples``
-                (Path B sample-weighted grads). Path A pre-scales on clients and leaves False.
+            normalize_by_total_samples: Ignored. SUM with total_samples>=1 always
+                does sum(n_i * x_i) / sum(n_i). Kept for Hydra constructor compat.
         """
         print(f"world_size={world_size}")
 
@@ -85,6 +94,16 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
         self._broadcast_state = {}
         self.agg_device = torch.device(agg_device or "cpu")
         self._compute_device = self.agg_device
+        self.chunk_threshold_bytes = int(
+            GRPC_CHUNK_THRESHOLD_BYTES
+            if chunk_threshold_bytes is None
+            else chunk_threshold_bytes
+        )
+        self.chunk_payload_bytes = int(
+            GRPC_CHUNK_PAYLOAD_BYTES
+            if chunk_payload_bytes is None
+            else chunk_payload_bytes
+        )
 
     def set_agg_device(self, device: torch.device | str) -> None:
         """Where decompress / running SUM / recompress run (OOM may demote to CPU)."""
@@ -107,6 +126,7 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
             "total_samples": 0,
             "participants": set(),
             "results_delivered": set(),
+            "compress_result": False,
         }
 
     def _session_has_participant(
@@ -167,6 +187,7 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
         session_state["result"] = None
         session_state["participants"] = set()
         session_state["results_delivered"] = set()
+        session_state["compress_result"] = False
         session_state["event"].clear()
 
     def _abandon_current_session(self) -> None:
@@ -211,13 +232,28 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
             raise
 
     def _accumulate_into_session(
-        self, session_state: dict[str, Any], participant_id: str, data: Any
+        self,
+        session_state: dict[str, Any],
+        participant_id: str,
+        data: Any,
+        num_samples: int = 0,
     ) -> None:
         """Running SUM/MEAN/MAX: keep one accumulator, drop this participant's copy."""
         if participant_id in session_state["participants"]:
             return
         payload = self._to_compute_device(self._coerce_tensor_dict(data), session_state)
         reduction = session_state.get("reduction_type")
+        ns = int(num_samples)
+        if (
+            ns > 0
+            and reduction != AggregationOp.MAX.value
+            and reduction != AggregationOp.MEAN.value
+        ):
+            with torch.no_grad():
+                payload = {
+                    key: (tensor * ns if torch.is_tensor(tensor) else tensor)
+                    for key, tensor in payload.items()
+                }
         accum = session_state.get("accum")
         with torch.no_grad():
             if accum is None:
@@ -320,10 +356,7 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
                 for tensor in aggregated_tensors.values():
                     if torch.is_tensor(tensor):
                         tensor /= self.world_size
-            elif (
-                reduction_type == AggregationOp.SUM.value
-                and self.normalize_by_total_samples
-            ):
+            elif reduction_type == AggregationOp.SUM.value:
                 total_samples = int(session_state.get("total_samples", 0))
                 if total_samples >= 1:
                     for tensor in aggregated_tensors.values():
@@ -362,12 +395,57 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
 
         with self.lock:
             if self._broadcast_state:
+                if should_chunk_payload(
+                    self._broadcast_state, self.chunk_threshold_bytes
+                ):
+                    n_chunks = max(
+                        chunk_count(
+                            self._broadcast_state, self.chunk_payload_bytes
+                        ),
+                        2,
+                    )
+                    print(
+                        f"Broadcast packed estimate needs {n_chunks} chunk(s) "
+                        f"for client {request.client_id}"
+                    )
+                    return grpc_pb2.OperationResponse(
+                        is_ready=True, n_chunks=n_chunks
+                    )
                 proto_tensordict = tensordict_to_proto(self._broadcast_state)
                 return grpc_pb2.OperationResponse(
-                    tensor_dict=proto_tensordict, is_ready=True
+                    tensor_dict=proto_tensordict, is_ready=True, n_chunks=1
                 )
-            else:
-                return grpc_pb2.OperationResponse(is_ready=False)
+            return grpc_pb2.OperationResponse(is_ready=False)
+
+    def GetBroadcastStateStream(self, request, context):
+        """Stream packed broadcast chunks for one logical GetBroadcastState."""
+        client_id = request.client_id
+        with self.lock:
+            state = self._broadcast_state
+        if not state:
+            yield grpc_pb2.OperationResponse(is_ready=False)
+            return
+        try:
+            chunks = list(
+                iter_payload_chunks(state, self.chunk_payload_bytes)
+            )
+            n_chunks = len(chunks)
+            print(
+                f"Streaming {n_chunks} broadcast chunk(s) to client {client_id}"
+            )
+            for index, chunk in enumerate(chunks):
+                yield grpc_pb2.OperationResponse(
+                    tensor_dict=tensordict_to_proto(chunk),
+                    is_ready=True,
+                    chunk_index=index,
+                    n_chunks=n_chunks,
+                )
+        except Exception as e:
+            warnings.warn(
+                f"Failed to stream broadcast state for client {client_id} | {e}",
+                RuntimeWarning,
+            )
+            yield grpc_pb2.OperationResponse(is_ready=False)
 
     def _create_aggregation_result_response(self, session_id: int):
         """
@@ -382,40 +460,109 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
         if session_id in self.aggregation_state:
             session_state = self.aggregation_state[session_id]
             if session_state["result"] is not None:
-                aggregated_tensors = session_state["result"]
-                # Grad sessions carry num_samples>0; sample/BN sessions stay dense.
-                active_compressor = (
-                    self.compressor
-                    if int(session_state.get("total_samples", 0)) > 0
-                    else None
+                compressed_tensordict, compressor_name = (
+                    self._compressed_aggregation_result(session_state)
                 )
-                try:
-                    compressed_tensordict = compress_message_tensors(
-                        aggregated_tensors,
-                        active_compressor,
-                        self.aggregation_metric,
-                    )
-                except Exception as exc:
-                    if self._compute_device.type == "cuda" and is_cuda_oom(exc):
-                        self._fallback_compute_to_cpu(session_state)
-                        aggregated_tensors = session_state["result"]
-                        compressed_tensordict = compress_message_tensors(
-                            aggregated_tensors,
-                            active_compressor,
-                            self.aggregation_metric,
+                if should_chunk_payload(
+                    compressed_tensordict, self.chunk_threshold_bytes
+                ):
+                    n_chunks = sum(
+                        1
+                        for _ in iter_payload_chunks(
+                            compressed_tensordict, self.chunk_payload_bytes
                         )
-                    else:
-                        raise
-                compressor_name = compressor_proto_name(active_compressor)
-                if isinstance(aggregated_tensors, torch.Tensor):
-                    compressor_name = None
-                    compressed_tensordict = aggregated_tensors
-                proto_tensordict = tensordict_to_proto(compressed_tensordict, compressor_name)
-                # proto_tensordict = tensordict_to_proto(aggregated_tensors)
+                    )
+                    return grpc_pb2.OperationResponse(
+                        is_ready=True, n_chunks=max(n_chunks, 2)
+                    )
+                proto_tensordict = tensordict_to_proto(
+                    compressed_tensordict, compressor_name
+                )
                 return grpc_pb2.OperationResponse(
-                    tensor_dict=proto_tensordict, is_ready=True
+                    tensor_dict=proto_tensordict, is_ready=True, n_chunks=1
                 )
         return grpc_pb2.OperationResponse(is_ready=False)
+
+    def _compressed_aggregation_result(self, session_state: dict[str, Any]):
+        aggregated_tensors = session_state["result"]
+        active_compressor = (
+            self.compressor if session_state.get("compress_result") else None
+        )
+        try:
+            compressed_tensordict = compress_message_tensors(
+                aggregated_tensors,
+                active_compressor,
+                self.aggregation_metric,
+            )
+        except Exception as exc:
+            if self._compute_device.type == "cuda" and is_cuda_oom(exc):
+                self._fallback_compute_to_cpu(session_state)
+                aggregated_tensors = session_state["result"]
+                compressed_tensordict = compress_message_tensors(
+                    aggregated_tensors,
+                    active_compressor,
+                    self.aggregation_metric,
+                )
+            else:
+                raise
+        compressor_name = compressor_proto_name(active_compressor)
+        if isinstance(aggregated_tensors, torch.Tensor):
+            compressor_name = None
+            compressed_tensordict = aggregated_tensors
+        return compressed_tensordict, compressor_name
+
+    def _ingest_client_payload(
+        self,
+        client_id: str,
+        data: Any,
+        reduction_type: str,
+        num_samples: int,
+        compressed_in: bool,
+        is_model_communicated: bool,
+    ) -> None:
+        """Lock must be held. One assembled payload per client per session."""
+        current_session = self.current_aggregation_session
+        session_state = self.aggregation_state[current_session]
+        if compressed_in:
+            session_state["compress_result"] = True
+
+        if (
+            session_state["reduction_type"] is not None
+            and session_state["reduction_type"] != reduction_type
+        ):
+            if self._submitted_count(session_state) < self.world_size:
+                print(
+                    f"Partial session {current_session} reduction mismatch "
+                    f"(expected={session_state['reduction_type']} "
+                    f"got={reduction_type}) — resetting session"
+                )
+                self._reset_aggregation_session(current_session)
+                session_state = self.aggregation_state[current_session]
+            else:
+                raise ValueError(
+                    f"Reduction mismatch | expected={session_state['reduction_type']} "
+                    f"got={reduction_type}"
+                )
+
+        if session_state["reduction_type"] is None:
+            session_state["reduction_type"] = reduction_type
+
+        self._accumulate_into_session(
+            session_state,
+            client_id,
+            data,
+            num_samples=int(num_samples),
+        )
+        session_state["total_samples"] = int(
+            session_state.get("total_samples", 0)
+        ) + int(num_samples)
+        data_count = self._submitted_count(session_state)
+        print(
+            f"Received from client {client_id} ({data_count}/{self.world_size} ready)"
+        )
+        self.perform_aggregation_if_ready(
+            session_state, current_session, is_model_communicated
+        )
 
     def SubmitForAggregation(self, request, context):
         """
@@ -431,55 +578,21 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
         Returns:
             StatusResponse indicating success or failure
         """
+        client_id = request.client_id
         with self.lock:
-            client_id = request.client_id
-            current_session = self.current_aggregation_session
-            # print(
-            #     f"Client {client_id} submitting {len(request.tensor_dict.entries)} tensors"
-            # )
-
             try:
-                # Deserialize; decompress onto agg_device (CPU if GPU does not fit).
-                data, is_model_communicated = proto_to_tensordict_extended(
-                    request.tensor_dict,
-                    overlay_base=None,
-                    compute_device=self._compute_device,
+                data, is_model_communicated, compressed_in = self._decode_tensor_dict(
+                    request.tensor_dict
                 )
-                # print(f"Now the data is ready: data = {data}")
-                session_state = self.aggregation_state[current_session]
-
-                if (
-                    session_state["reduction_type"] is not None
-                    and session_state["reduction_type"] != request.reduction_type
-                ):
-                    if self._submitted_count(session_state) < self.world_size:
-                        print(
-                            f"Partial session {current_session} reduction mismatch "
-                            f"(expected={session_state['reduction_type']} "
-                            f"got={request.reduction_type}) — resetting session"
-                        )
-                        self._reset_aggregation_session(current_session)
-                    else:
-                        raise ValueError(
-                            f"Reduction mismatch | expected={session_state['reduction_type']} "
-                            f"got={request.reduction_type}"
-                        )
-
-                if session_state["reduction_type"] is None:
-                    session_state["reduction_type"] = request.reduction_type
-
-                self._accumulate_into_session(session_state, client_id, data)
-                session_state["total_samples"] = int(
-                    session_state.get("total_samples", 0)
-                ) + int(request.num_samples)
-                data_count = self._submitted_count(session_state)
-                print(
-                    f"Received from client {client_id} ({data_count}/{self.world_size} ready)"
+                self._ingest_client_payload(
+                    client_id,
+                    data,
+                    request.reduction_type,
+                    int(request.num_samples),
+                    compressed_in,
+                    is_model_communicated,
                 )
-
-                self.perform_aggregation_if_ready(session_state, current_session, is_model_communicated)
                 return grpc_pb2.StatusResponse(success=True)
-
             except Exception as e:
                 print(f"Error is: {e}")
                 traceback.print_exc()
@@ -488,11 +601,80 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
                     RuntimeWarning,
                 )
                 try:
+                    session_state = self.aggregation_state[
+                        self.current_aggregation_session
+                    ]
                     if self._submitted_count(session_state) < self.world_size:
                         self._abandon_current_session()
                 except Exception:
                     pass
                 return grpc_pb2.StatusResponse(success=False)
+
+    def _decode_tensor_dict(self, tensor_dict):
+        data, is_model_communicated = proto_to_tensordict_extended(
+            tensor_dict,
+            overlay_base=None,
+            compute_device=self._compute_device,
+        )
+        compressed_in = any(
+            bool(getattr(entry, "compression_type", "") or "")
+            for entry in tensor_dict.entries
+        )
+        return data, is_model_communicated, compressed_in
+
+    def SubmitAggregationStream(self, request_iterator, context):
+        """One logical submit: assemble chunks, then the same SUM as unary."""
+        client_id = None
+        reduction_type = None
+        num_samples = 0
+        decoded_chunks: list[dict] = []
+        compressed_in = False
+        is_model_communicated = False
+        try:
+            for request in request_iterator:
+                client_id = request.client_id
+                if not decoded_chunks:
+                    reduction_type = request.reduction_type
+                    num_samples = int(request.num_samples)
+                data, model_flag, chunk_compressed = self._decode_tensor_dict(
+                    request.tensor_dict
+                )
+                decoded_chunks.append(data)
+                compressed_in = compressed_in or chunk_compressed
+                is_model_communicated = is_model_communicated or model_flag
+            if not decoded_chunks or client_id is None:
+                return grpc_pb2.StatusResponse(success=False)
+            assembled = assemble_payload_chunks(decoded_chunks)
+            print(
+                f"Assembled {len(decoded_chunks)} uplink chunks from client {client_id}"
+            )
+            with self.lock:
+                self._ingest_client_payload(
+                    client_id,
+                    assembled,
+                    reduction_type or "",
+                    num_samples,
+                    compressed_in,
+                    is_model_communicated,
+                )
+            return grpc_pb2.StatusResponse(success=True)
+        except Exception as e:
+            print(f"Error is: {e}")
+            traceback.print_exc()
+            warnings.warn(
+                f"Failed to process streamed aggregation from client {client_id} | {e}",
+                RuntimeWarning,
+            )
+            with self.lock:
+                try:
+                    session_state = self.aggregation_state[
+                        self.current_aggregation_session
+                    ]
+                    if self._submitted_count(session_state) < self.world_size:
+                        self._abandon_current_session()
+                except Exception:
+                    pass
+            return grpc_pb2.StatusResponse(success=False)
 
     def GetAggregationResult(self, request, context):
         """
@@ -511,15 +693,7 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
         client_id = request.client_id
 
         with self.lock:
-            target_session = None
-            for session_id in sorted(self.aggregation_state.keys(), reverse=True):
-                session_state = self.aggregation_state[session_id]
-                if not self._session_has_participant(session_state, client_id):
-                    continue
-                if client_id in session_state.get("results_delivered", set()):
-                    continue
-                target_session = session_id
-                break
+            target_session = self._find_undelivered_session(client_id)
             if target_session is None:
                 warnings.warn(
                     f"Client {client_id} has no data submitted for aggregation",
@@ -535,9 +709,10 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
                 if session_state["result"] is not None:
                     print(f"Sending aggregated model to client {client_id}")
                     response = self._create_aggregation_result_response(target_session)
-                    self._mark_aggregation_result_delivered_locked(
-                        target_session, client_id
-                    )
+                    if int(response.n_chunks) <= 1:
+                        self._mark_aggregation_result_delivered_locked(
+                            target_session, client_id
+                        )
                     return response
 
             print(f"Client {client_id} waiting for aggregation to complete")
@@ -547,9 +722,10 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
                 if session_state["result"] is not None:
                     print(f"Sending aggregated model to client {client_id}")
                     response = self._create_aggregation_result_response(target_session)
-                    self._mark_aggregation_result_delivered_locked(
-                        target_session, client_id
-                    )
+                    if int(response.n_chunks) <= 1:
+                        self._mark_aggregation_result_delivered_locked(
+                            target_session, client_id
+                        )
                     return response
             return grpc_pb2.OperationResponse(is_ready=False)
 
@@ -559,6 +735,70 @@ class GrpcServer(grpc_pb2_grpc.GrpcServerServicer):
                 RuntimeWarning,
             )
             return grpc_pb2.OperationResponse(is_ready=False)
+
+    def _find_undelivered_session(self, client_id: str) -> int | None:
+        for session_id in sorted(self.aggregation_state.keys(), reverse=True):
+            session_state = self.aggregation_state[session_id]
+            if not self._session_has_participant(session_state, client_id):
+                continue
+            if client_id in session_state.get("results_delivered", set()):
+                continue
+            return session_id
+        return None
+
+    def GetAggregationResultStream(self, request, context):
+        """Stream packed result chunks for one logical Get."""
+        client_id = request.client_id
+        with self.lock:
+            target_session = self._find_undelivered_session(client_id)
+        if target_session is None:
+            yield grpc_pb2.OperationResponse(is_ready=False)
+            return
+
+        session_state = self.aggregation_state[target_session]
+        if session_state["result"] is None:
+            session_state["event"].wait()
+
+        try:
+            with self.lock:
+                if session_state["result"] is None:
+                    packed = None
+                else:
+                    compressed_tensordict, compressor_name = (
+                        self._compressed_aggregation_result(session_state)
+                    )
+                    chunks = list(
+                        iter_payload_chunks(
+                            compressed_tensordict, self.chunk_payload_bytes
+                        )
+                    )
+                    packed = [
+                        tensordict_to_proto(chunk, compressor_name) for chunk in chunks
+                    ]
+            if packed is None:
+                yield grpc_pb2.OperationResponse(is_ready=False)
+                return
+            n_chunks = len(packed)
+            print(
+                f"Streaming {n_chunks} result chunks to client {client_id}"
+            )
+            for index, proto_tensordict in enumerate(packed):
+                yield grpc_pb2.OperationResponse(
+                    tensor_dict=proto_tensordict,
+                    is_ready=True,
+                    chunk_index=index,
+                    n_chunks=n_chunks,
+                )
+            with self.lock:
+                self._mark_aggregation_result_delivered_locked(
+                    target_session, client_id
+                )
+        except Exception as e:
+            warnings.warn(
+                f"Failed to stream aggregation result for client {client_id} | {e}",
+                RuntimeWarning,
+            )
+            yield grpc_pb2.OperationResponse(is_ready=False)
 
     def RegisterClient(self, request, context):
         """

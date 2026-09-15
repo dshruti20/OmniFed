@@ -46,8 +46,8 @@ class TestClassicPerIterationSummary(unittest.TestCase):
                 _summary_iter_comm={
                     "grpc_upstream_s": 0.8,
                     "grpc_downstream_s": 0.7,
-                    "grpc_compress_s": 0.05,
-                    "grpc_decompress_s": 0.02,
+                    "grpc_pack_s": 0.05,
+                    "grpc_unpack_s": 0.02,
                 },
             )
             algo.peek_metric = mock.Mock(
@@ -82,10 +82,60 @@ class TestClassicPerIterationSummary(unittest.TestCase):
             self.assertEqual(row["train_loss"], "1.250000")
             self.assertEqual(row["grpc_agg_grad_s"], "1.200000")
             self.assertEqual(row["grpc_upstream_s"], "0.800000")
+            self.assertEqual(row["grpc_pack_s"], "0.050000")
+            self.assertEqual(row["grpc_unpack_s"], "0.020000")
             self.assertAlmostEqual(float(row["sync_time_total_s"]), 1.511)
             self.assertEqual(row["gpu_device_used_mb"], "8192.000000")
             self.assertEqual(row["gpu_device_total_mb"], "65536.000000")
             self.assertEqual(row["gpu_device_util_pct"], "12.500000")
+
+    def test_torchdist_unused_columns_are_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = ClassicIterationRecorder(
+                rank=0, log_dir=tmp, comm_backend="torchdist"
+            )
+            algo = SimpleNamespace(
+                round_idx=0,
+                epoch_idx=0,
+                batch_idx=0,
+                experiment_batch_idx=0,
+                _summary_iter_batch_t0=None,
+                _summary_iter_train={},
+                _summary_iter_sync={"grpc_agg_grad_time": 1.5},
+                _summary_iter_comm={
+                    "grpc_upstream_s": 0.0,
+                    "grpc_downstream_s": 0.0,
+                    "grpc_pack_s": 0.0,
+                    "grpc_unpack_s": 0.0,
+                },
+            )
+            algo.peek_metric = mock.Mock(return_value=None)
+            with mock.patch(
+                "src.omnifed.summary.per_iteration_classic.get_gpu_memory_snapshot_mb",
+                return_value={
+                    "gpu_allocated_mb": None,
+                    "gpu_reserved_mb": None,
+                    "gpu_max_allocated_mb": None,
+                    "gpu_max_reserved_mb": None,
+                    "gpu_device_used_mb": None,
+                    "gpu_device_total_mb": None,
+                    "gpu_device_util_pct": None,
+                },
+            ):
+                recorder.record_after_batch(algo)
+            csv_path = os.path.join(tmp, "rank0_classic_per_iteration_summary.csv")
+            with open(csv_path, encoding="utf-8") as f:
+                row = list(csv.DictReader(f))[0]
+            self.assertEqual(row["comm_backend"], "torchdist")
+            self.assertEqual(row["grpc_agg_grad_s"], "1.500000")
+            self.assertEqual(row["grpc_agg_sample_s"], "0.000000")
+            self.assertEqual(row["grpc_agg_bn_s"], "0.000000")
+            self.assertEqual(row["grad_apply_s"], "0.000000")
+            self.assertEqual(row["grpc_upstream_s"], "0.000000")
+            self.assertEqual(row["grpc_downstream_s"], "0.000000")
+            self.assertEqual(row["grpc_pack_s"], "0.000000")
+            self.assertEqual(row["grpc_unpack_s"], "0.000000")
+            self.assertEqual(row["sync_time_total_s"], "1.500000")
 
     def test_install_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

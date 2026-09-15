@@ -4,6 +4,19 @@
 Classic centralized per-iteration CSV recorder.
 
 Used by the universal ``summary.per_iteration`` dispatcher when pipeline mode is ``classic``.
+
+One schema for every model and layout. Hops that did not run stay 0.
+
+Column meaning (names kept for existing plots):
+
+- ``grpc_agg_grad_s``: wall time of the payload aggregate (gRPC Submit+Get, or
+  TorchDist all-reduce / Top-K all_gather). Param and grad hops both use this.
+- ``grpc_agg_bn_s``: extra BN-buffer aggregate (FedSGD + ResNet). 0 for Llama.
+- ``grpc_agg_sample_s``: hierarchical sample-count hop only. 0 on single-level.
+- ``grad_apply_s``: FedSGD ``optimizer.step`` after averaging grads. 0 for FedAvg.
+- ``grpc_upstream_s`` / ``grpc_downstream_s``: gRPC Submit / Get only. 0 on TorchDist.
+- ``grpc_pack_s`` / ``grpc_unpack_s``: codec (or gRPC protobuf encode/decode).
+  Dense TorchDist leaves both 0; collectives are only in ``grpc_agg_grad_s``.
 """
 
 from __future__ import annotations
@@ -33,8 +46,8 @@ _ITER_CSV_COLUMNS = [
     "grad_apply_s",
     "grpc_upstream_s",
     "grpc_downstream_s",
-    "grpc_compress_s",
-    "grpc_decompress_s",
+    "grpc_pack_s",
+    "grpc_unpack_s",
     "gpu_allocated_mb",
     "gpu_reserved_mb",
     "gpu_max_allocated_mb",
@@ -49,8 +62,8 @@ _ITER_CSV_COLUMNS = [
 _COMM_KEYS = (
     "grpc_upstream_s",
     "grpc_downstream_s",
-    "grpc_compress_s",
-    "grpc_decompress_s",
+    "grpc_pack_s",
+    "grpc_unpack_s",
 )
 
 _SYNC_KEYS = (
@@ -126,7 +139,7 @@ class ClassicIterationRecorder:
 
     def reset_batch(self, algorithm: Any) -> None:
         algorithm._summary_iter_comm = {k: 0.0 for k in _COMM_KEYS}
-        algorithm._summary_iter_sync = {}
+        algorithm._summary_iter_sync = {k: 0.0 for k in _SYNC_KEYS}
         algorithm._summary_iter_batch_t0 = time.perf_counter()
         algorithm._summary_iter_train = {}
 
@@ -153,7 +166,7 @@ class ClassicIterationRecorder:
         comm_times: Dict[str, float] = getattr(algorithm, "_summary_iter_comm", {}) or {}
 
         sync_parts = [float(sync_times.get(k, 0.0) or 0.0) for k in _SYNC_KEYS]
-        sync_time_total_s = sum(sync_parts) if any(sync_parts) else None
+        sync_time_total_s = sum(sync_parts)
 
         gpu = get_gpu_memory_snapshot_mb()
 
@@ -169,14 +182,14 @@ class ClassicIterationRecorder:
             "train_loss": _fmt(train_loss),
             "train_grad_norm": _fmt(train_grad_norm),
             "sync_time_total_s": _fmt(sync_time_total_s),
-            "grpc_agg_sample_s": _fmt(sync_times.get("grpc_agg_sample_time")),
-            "grpc_agg_grad_s": _fmt(sync_times.get("grpc_agg_grad_time")),
-            "grpc_agg_bn_s": _fmt(sync_times.get("grpc_agg_bn_time")),
-            "grad_apply_s": _fmt(sync_times.get("grad_apply_time")),
-            "grpc_upstream_s": _fmt(comm_times.get("grpc_upstream_s")),
-            "grpc_downstream_s": _fmt(comm_times.get("grpc_downstream_s")),
-            "grpc_compress_s": _fmt(comm_times.get("grpc_compress_s")),
-            "grpc_decompress_s": _fmt(comm_times.get("grpc_decompress_s")),
+            "grpc_agg_sample_s": _fmt(sync_times.get("grpc_agg_sample_time", 0.0) or 0.0),
+            "grpc_agg_grad_s": _fmt(sync_times.get("grpc_agg_grad_time", 0.0) or 0.0),
+            "grpc_agg_bn_s": _fmt(sync_times.get("grpc_agg_bn_time", 0.0) or 0.0),
+            "grad_apply_s": _fmt(sync_times.get("grad_apply_time", 0.0) or 0.0),
+            "grpc_upstream_s": _fmt(comm_times.get("grpc_upstream_s", 0.0) or 0.0),
+            "grpc_downstream_s": _fmt(comm_times.get("grpc_downstream_s", 0.0) or 0.0),
+            "grpc_pack_s": _fmt(comm_times.get("grpc_pack_s", 0.0) or 0.0),
+            "grpc_unpack_s": _fmt(comm_times.get("grpc_unpack_s", 0.0) or 0.0),
             **{k: _fmt(v) for k, v in gpu.items()},
             "comm_backend": self.comm_backend,
             "aggregate_payload": self.aggregate_payload,

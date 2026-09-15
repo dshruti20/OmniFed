@@ -1,4 +1,4 @@
-"""GrpcServer sample-weighted aggregation for classic grad Path B."""
+"""GrpcServer sample-weighted aggregation: n_i on the payload RPC."""
 
 from __future__ import annotations
 
@@ -11,32 +11,30 @@ from src.omnifed.communicator.grpc_server import GrpcServer
 
 
 class TestGrpcServerSampleWeighted(unittest.TestCase):
-    def test_sum_divides_by_total_samples_when_enabled(self) -> None:
-        server = GrpcServer(
-            world_size=2,
-            normalize_by_total_samples=True,
-            communicate_params=False,
-        )
+    def test_payload_sum_weights_by_num_samples(self) -> None:
+        """sum(n_i x_i) / sum(n_i) on one RPC — no Path A/B flag."""
+        server = GrpcServer(world_size=2, communicate_params=False)
         session_id = server.current_aggregation_session
         session_state = server.aggregation_state[session_id]
         session_state["reduction_type"] = AggregationOp.SUM.value
-        session_state["data"] = {
-            "1": {"w": torch.tensor([2.0, 4.0])},
-            "2": {"w": torch.tensor([4.0, 8.0])},
-        }
-        session_state["total_samples"] = 100
-
-        done = server.perform_aggregation_if_ready(session_state, session_id)
-        self.assertTrue(done)
-        result = session_state["result"]["w"]
-        torch.testing.assert_close(result, torch.tensor([0.06, 0.12]))
+        server._accumulate_into_session(
+            session_state, "1", {"w": torch.tensor([1.0, 2.0])}, num_samples=2
+        )
+        server._accumulate_into_session(
+            session_state, "2", {"w": torch.tensor([3.0, 4.0])}, num_samples=6
+        )
+        session_state["total_samples"] = 8
+        self.assertTrue(server.perform_aggregation_if_ready(session_state, session_id))
+        # (2*[1,2] + 6*[3,4]) / 8 = [20, 28] / 8
+        torch.testing.assert_close(
+            session_state["result"]["w"], torch.tensor([2.5, 3.5])
+        )
 
 
     def test_sum_skips_normalize_when_no_sample_count(self) -> None:
-        """Epoch-heartbeat scalar SUM has total_samples=0; leave unnormalized."""
+        """Heartbeat / BN-style SUM with total_samples=0 stays a raw SUM."""
         server = GrpcServer(
             world_size=2,
-            normalize_by_total_samples=True,
             communicate_params=False,
         )
         session_id = server.current_aggregation_session

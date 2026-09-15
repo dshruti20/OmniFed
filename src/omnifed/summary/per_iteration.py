@@ -65,14 +65,13 @@ def install_iteration_recorder(
 ) -> Optional[ClassicIterationRecorder]:
     """Install per-iteration CSV hooks for the pipeline implied by ``cfg``."""
     mode = summary_mode_from_cfg(cfg)
-    if mode == "classic":
+    if mode in ("classic", "single_level"):
         return install_classic_iteration_recorder(
             algorithm,
             rank=rank,
             log_dir=log_dir,
             comm_backend=comm_backend,
             aggregate_payload=aggregate_payload,
-            mode=mode,
+            mode="classic",
         )
-    # Hybrid per-iteration CSV: not implemented yet.
     return None

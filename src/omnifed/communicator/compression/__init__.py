@@ -26,6 +26,24 @@ def is_compressor(obj: Any) -> bool:
     return isinstance(obj, Compression)
 
 
+def _is_absent_compressor(obj: Any) -> bool:
+    """True when yaml has no compressor (None or Hydra empty mapping from dense.yaml)."""
+    if obj is None:
+        return True
+    if isinstance(obj, dict) and not obj:
+        return True
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(obj):
+            if OmegaConf.select(obj, "_target_", default=None) is not None:
+                return False
+            return len(obj) == 0
+    except Exception:
+        return False
+    return False
+
+
 def resolve_compressor(
     compressor=None,
     client_compressor=None,
@@ -36,6 +54,8 @@ def resolve_compressor(
     ``compressor`` is canonical. ``client_compressor`` / ``server_compressor``
     are deprecated aliases (same object for both ranks).
     """
+    if _is_absent_compressor(compressor):
+        compressor = None
     legacy = [c for c in (client_compressor, server_compressor) if c is not None]
     if compressor is not None:
         if legacy:

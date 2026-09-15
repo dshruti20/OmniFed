@@ -30,12 +30,21 @@ __all__ = [
     "write_hybrid_slurm_per_round_summary",
 ]
 
-_SUMMARY_MODES = ("classic", "hybrid")
+_SUMMARY_MODES = ("single_level", "hierarchical", "classic", "hybrid")
+
+
+def _canonical_summary_mode(mode: str) -> str:
+    m = str(mode).lower()
+    if m in ("classic", "single_level"):
+        return "single_level"
+    if m in ("hybrid", "hierarchical"):
+        return "hierarchical"
+    raise ValueError(f"summary mode must be single_level or hierarchical, got {mode!r}")
 
 
 def _poll_settings(mode: str, world_size: int) -> Tuple[float, float]:
     default_timeout = str(max(90.0, 5.0 * float(world_size)))
-    if mode == "classic":
+    if mode == "single_level":
         timeout_s = float(
             os.environ.get(
                 "OMNIFED_CLASSIC_SUMMARY_POLL_SEC",
@@ -57,7 +66,7 @@ def _poll_settings(mode: str, world_size: int) -> Tuple[float, float]:
 
 
 def _poll_timeout_env_name(mode: str) -> str:
-    if mode == "classic":
+    if mode == "single_level":
         return "OMNIFED_CLASSIC_SUMMARY_POLL_SEC"
     return "OMNIFED_HYBRID_SUMMARY_POLL_SEC"
 
@@ -153,11 +162,9 @@ def write_slurm_per_round_summary(
 ) -> Optional[str]:
     """Poll trainer metrics and write per-round summary for ``mode`` (classic or hybrid)."""
     _ = rank_writer
-    mode_norm = str(mode).lower()
-    if mode_norm not in _SUMMARY_MODES:
-        raise ValueError(f"summary mode must be one of {_SUMMARY_MODES}, got {mode!r}")
-    if mode_norm == "hybrid" and topo is None:
-        raise ValueError("topo is required when mode='hybrid'")
+    mode_norm = _canonical_summary_mode(mode)
+    if mode_norm == "hierarchical" and topo is None:
+        raise ValueError("topo is required when topology is hierarchical")
 
     trainer_ranks = _trainer_ranks(world_size, rpc_server_rank)
     if not trainer_ranks:
@@ -173,7 +180,7 @@ def write_slurm_per_round_summary(
     ):
         return None
 
-    contexts = ("sync", "eval", "train") if mode_norm == "classic" else ("sync", "eval")
+    contexts = ("sync", "eval", "train") if mode_norm == "single_level" else ("sync", "eval")
     payloads = payloads_from_metrics_full_for_trainers(
         hydra_out_dir,
         trainer_ranks=trainer_ranks,
@@ -191,7 +198,7 @@ def write_slurm_per_round_summary(
         contexts=contexts,
     )
 
-    if mode_norm == "classic":
+    if mode_norm == "single_level":
         md_txt, csv_txt = build_classic_per_round_tables(
             payloads=payloads,
             trainer_ranks=trainer_ranks,
@@ -231,8 +238,8 @@ def write_slurm_per_round_summary_for_run(
 ) -> Optional[str]:
     """Detect pipeline from ``cfg`` and write the matching per-round summary."""
     mode = summary_mode_from_cfg(cfg)
-    if mode == "hybrid" and topo is None:
-        raise ValueError("topo is required when engine.communication_mode='hybrid'")
+    if mode == "hierarchical" and topo is None:
+        raise ValueError("topo is required when topology is hierarchical")
     return write_slurm_per_round_summary(
         hydra_out_dir,
         mode=mode,
@@ -252,7 +259,7 @@ def write_classic_slurm_per_round_summary(
 ) -> Optional[str]:
     return write_slurm_per_round_summary(
         hydra_out_dir,
-        mode="classic",
+        mode="single_level",
         world_size=world_size,
         rpc_server_rank=rpc_server_rank,
         rank_writer=rank_writer,
@@ -269,7 +276,7 @@ def write_hybrid_slurm_per_round_summary(
 ) -> Optional[str]:
     return write_slurm_per_round_summary(
         hydra_out_dir,
-        mode="hybrid",
+        mode="hierarchical",
         world_size=world_size,
         rpc_server_rank=rpc_server_rank,
         rank_writer=rank_writer,

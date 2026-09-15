@@ -16,13 +16,21 @@ from src.omnifed.device_resolver import (
     cuda_device_for_local_rank,
     resolve_slurm_devices,
 )
-from src.omnifed.engine_communication import communication_mode
-from src.omnifed.classic.classic_grad_config import (
-    classic_aggregate_payload_from_cfg,
-    format_classic_grad_policy,
+from src.omnifed.engine_communication import is_hierarchical_cfg
+from src.omnifed.algorithm.aggregate_payload import (
+    aggregate_payload_from_cfg,
+    format_aggregate_payload_policy,
 )
 from src.omnifed.communicator import AggregationOp
-from src.omnifed.utils import print  # pretty printer used elsewhere
+from src.omnifed.data.federated_shards import (
+    apply_federated_shard_env,
+    topology_has_server,
+)
+from src.omnifed.summary.startup import (
+    emit_model_startup,
+    instantiate_model_timed,
+    move_model_to_device_timed,
+)
 
 import threading
 from datetime import datetime
@@ -88,6 +96,53 @@ def _classic_comm_backend_name(local_comm) -> str:
     if "torchdist" in name:
         return "torchdist"
     return name
+
+
+def _bind_cuda_device(device: torch.device) -> None:
+    """Pin this process to ``device`` before NCCL ``init_process_group``."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.set_device(device.index or 0)
+
+
+def _setup_classic_communicator_before_load(
+    *,
+    rank: int,
+    local_comm,
+    hydra_out_dir: str,
+    master_addr: str,
+    master_port: str,
+) -> None:
+    """Join the wire before ``from_pretrained`` / C4 I/O.
+
+    TorchDist TCPStore times out if a straggler loads first then joins.
+    gRPC rank 0 already listened early; clients connect here so they are
+    not racing the server during model load.
+    """
+    backend = _classic_comm_backend_name(local_comm)
+    if backend == "grpc" and _uses_grpc_centralized_server(local_comm):
+        if local_comm.is_server:
+            local_comm.setup()
+            ready_path = _write_grpc_server_ready_marker(
+                hydra_out_dir, master_addr=master_addr, master_port=master_port
+            )
+            print(
+                f"[slurm_worker] rank 0: gRPC server started early (before model load); "
+                f"ready marker -> {ready_path}",
+                flush=True,
+            )
+            return
+        _wait_for_grpc_server_ready_marker(hydra_out_dir, rank=rank)
+        local_comm.setup()
+        print(
+            f"[slurm_worker] rank={rank}: gRPC client connected before model load",
+            flush=True,
+        )
+        return
+    print(
+        f"[slurm_worker] rank={rank}: {backend} init_process_group before model load",
+        flush=True,
+    )
+    local_comm.setup()
 
 
 def install_preemption_handlers(on_checkpoint):
@@ -268,10 +323,10 @@ def main():
     ckpt_dir = raw.get("slurm_checkpoint_dir") or os.path.join(hydra_out_dir, "engine", "ckpt")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    if communication_mode(cfg) == "hybrid":
-        from src.omnifed.hybrid.slurm_hybrid_runner import run_hybrid_training
+    if is_hierarchical_cfg(cfg):
+        from src.omnifed.hierarchical.slurm_runner import run_hierarchical_training
 
-        run_hybrid_training(cfg, hydra_out_dir, ckpt_dir)
+        run_hierarchical_training(cfg, hydra_out_dir, ckpt_dir)
         raise SystemExit(0)
 
     # ---------- Slurm sizing & env ----------
@@ -318,6 +373,16 @@ def main():
     )
 
     print(f"[main]  rank={rank} world={world} MASTER_ADDR={os.environ['MASTER_ADDR']} PORT={os.environ['MASTER_PORT']}", flush=True)
+    num_trainers = int(OmegaConf.select(cfg, "topology.num_clients"))
+    has_server = topology_has_server(cfg.topology)
+    apply_federated_shard_env(
+        rank=rank, num_trainers=num_trainers, has_server=has_server
+    )
+    print(
+        f"[slurm_worker] federated shards: rank={rank} num_trainers={num_trainers} "
+        f"has_server={has_server} index={os.environ.get('OMNIFED_FEDERATED_CLIENT_INDEX')}",
+        flush=True,
+    )
     _gpu_probe(prefix=f"[rank{rank}]")
 
     # ---------- Build topology & pick this node ----------
@@ -343,24 +408,7 @@ def main():
     local_comm  = instantiate(node_cfg.local_comm)  # default _recursive_=True
     global_comm = instantiate(node_cfg.global_comm) if getattr(node_cfg, "global_comm", None) else None
 
-    # Multi-node Slurm: rank 0 listens early; clients wait on a shared Lustre marker
-    # before connecting (task launch order across nodes is nondeterministic).
-    if rank == 0 and _uses_grpc_centralized_server(local_comm) and local_comm.is_server:
-        local_comm.setup()
-        ready_path = _write_grpc_server_ready_marker(
-            hydra_out_dir, master_addr=master_addr, master_port=master_port
-        )
-        print(
-            f"[slurm_worker] rank 0: gRPC server started early (before model load); "
-            f"ready marker -> {ready_path}",
-            flush=True,
-        )
-
-    model       = instantiate(cfg.model)
-    datamodule  = instantiate(cfg.datamodule)
-    algorithm   = instantiate(node_cfg.algorithm, log_dir=node_log_dir)
-
-    # ---------- Device selection ----------
+    # Device + process group / gRPC listen before heavy checkpoint I/O.
     devices = resolve_slurm_devices(
         node_cfg, rank=rank, local_rank=local_rank, local_comm=local_comm
     )
@@ -372,8 +420,32 @@ def main():
     )
     if hasattr(local_comm, "set_agg_device"):
         local_comm.set_agg_device(devices.agg_device)
+    _bind_cuda_device(device)
+    if devices.agg_device.type == "cuda":
+        _bind_cuda_device(devices.agg_device)
+    _setup_classic_communicator_before_load(
+        rank=rank,
+        local_comm=local_comm,
+        hydra_out_dir=hydra_out_dir,
+        master_addr=master_addr,
+        master_port=master_port,
+    )
+
+    model, model_load_s = instantiate_model_timed(cfg.model)
+    datamodule  = instantiate(cfg.datamodule)
+    algorithm   = instantiate(node_cfg.algorithm, log_dir=node_log_dir)
+
     original_device = next(model.parameters()).device
-    model = model.to(device, non_blocking=True)
+    model, model_to_device_s = move_model_to_device_timed(
+        model, device, non_blocking=True
+    )
+    startup_log_dir = os.path.join(hydra_out_dir, "engine")
+    emit_model_startup(
+        rank=rank,
+        log_dir=startup_log_dir,
+        model_load_s=model_load_s,
+        model_to_device_s=model_to_device_s,
+    )
 
     mem_logger = start_gpu_memory_logger(
         rank=rank,
@@ -392,13 +464,7 @@ def main():
         mem_stop_event = None
         mem_log_path = ""
 
-    # ---------- Init process group via communicator ----------
-    if (
-        rank != 0
-        and _uses_grpc_centralized_server(local_comm)
-        and not local_comm.is_server
-    ):
-        _wait_for_grpc_server_ready_marker(hydra_out_dir, rank=rank)
+    # Idempotent if `_setup_classic_communicator_before_load` already ran.
     local_comm.setup()
     if global_comm:
         global_comm.setup()
@@ -454,6 +520,14 @@ def main():
         epochs_per_round,
         total_rounds,
     )
+    emit_model_startup(
+        rank=rank,
+        log_dir=startup_log_dir,
+        model_load_s=model_load_s,
+        model_to_device_s=model_to_device_s,
+        algorithm=algorithm,
+        write_csv=False,
+    )
 
     # After algorithm.setup(): logger may call progress_info_str during gRPC metrics.
     if hasattr(local_comm, "set_logger"):
@@ -461,40 +535,34 @@ def main():
     if global_comm and hasattr(global_comm, "set_logger"):
         global_comm.set_logger(algorithm)
 
-    if classic_aggregate_payload_from_cfg(cfg) == "gradients":
-        from src.omnifed.classic.classic_grad_slurm import install_classic_grad_slurm_sync
-        from src.omnifed.summary.per_iteration import install_iteration_recorder
+    payload = aggregate_payload_from_cfg(cfg)
+    algorithm.set_aggregate_payload(payload)
+    if hasattr(local_comm, "communicate_params"):
+        comm_params = payload != "gradients"
+        local_comm.communicate_params = comm_params
+        for obj in (
+            getattr(local_comm, "_client", None),
+            getattr(local_comm, "_servicer", None),
+        ):
+            if obj is not None and hasattr(obj, "communicate_params"):
+                obj.communicate_params = comm_params
 
-        print(
-            f"[slurm_worker] classic grad track: {format_classic_grad_policy(cfg)}",
-            flush=True,
-        )
-        install_iteration_recorder(
-            cfg,
-            algorithm,
-            rank=rank,
-            log_dir=os.path.join(hydra_out_dir, "engine"),
-            comm_backend=_classic_comm_backend_name(local_comm),
-            aggregate_payload="gradients",
-        )
-        install_classic_grad_slurm_sync(algorithm, local_comm=local_comm)
-    elif classic_aggregate_payload_from_cfg(cfg) == "params":
-        from src.omnifed.classic.classic_param_slurm import install_classic_param_slurm_sync
-        from src.omnifed.summary.per_iteration import install_iteration_recorder
+    from src.omnifed.execution.slurm.worker_helpers import install_round_end_eval
+    from src.omnifed.summary.per_iteration import install_iteration_recorder
 
-        print(
-            "[slurm_worker] classic param track: aggregate_payload='params' (batch_end sync)",
-            flush=True,
-        )
-        install_iteration_recorder(
-            cfg,
-            algorithm,
-            rank=rank,
-            log_dir=os.path.join(hydra_out_dir, "engine"),
-            comm_backend=_classic_comm_backend_name(local_comm),
-            aggregate_payload="params",
-        )
-        install_classic_param_slurm_sync(algorithm, local_comm=local_comm)
+    print(
+        f"[slurm_worker] classic helper: {format_aggregate_payload_policy(cfg)}",
+        flush=True,
+    )
+    install_iteration_recorder(
+        cfg,
+        algorithm,
+        rank=rank,
+        log_dir=os.path.join(hydra_out_dir, "engine"),
+        comm_backend=_classic_comm_backend_name(local_comm),
+        aggregate_payload=payload,
+    )
+    install_round_end_eval(algorithm, local_comm=local_comm)
 
     # Ensure the algorithm's model lives on our chosen device
     # try:

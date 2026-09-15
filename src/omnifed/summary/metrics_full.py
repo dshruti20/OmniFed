@@ -10,7 +10,7 @@ import math
 import os
 from typing import Any, Dict, List, Optional, Sequence
 
-from src.omnifed.hybrid.topology_roles import hybrid_rank_to_centralized_node_index
+from src.omnifed.hierarchical.topology_roles import hybrid_rank_to_centralized_node_index
 
 _METRICS_FULL_META_COLS = ("global_step", "round_idx", "epoch_idx", "batch_idx")
 

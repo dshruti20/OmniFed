@@ -1,4 +1,4 @@
-"""Regression: classic synchronous grad hooks."""
+"""Classic grad/param slurm filenames are gone; one worker helper remains."""
 
 from __future__ import annotations
 
@@ -6,27 +6,28 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from src.omnifed.classic.classic_grad_slurm import install_classic_grad_slurm_sync
+from src.omnifed.execution.slurm.worker_helpers import install_round_end_eval
 
 
-class TestClassicGradSlurmHooks(unittest.TestCase):
-    def test_round_start_calls_base_once(self) -> None:
+class TestRoundEndEvalHelper(unittest.TestCase):
+    def test_install_wraps_round_end_eval(self) -> None:
         calls: list[str] = []
 
         class Algo(SimpleNamespace):
-            def _base_round_start(self) -> None:
+            progress_info_str = "t"
+            datamodule = SimpleNamespace(eval=object())
+            local_model = object()
+
+            def _round_end(self) -> None:
                 calls.append("base")
 
+            def _BaseAlgorithm__eval_epoch(self, model) -> None:
+                calls.append("eval")
+
         algo = Algo()
-        algo._round_start = algo._base_round_start
-        algo._BaseAlgorithm__local_optimizer = mock.Mock()
-        algo.local_comm = mock.Mock()
-
-        install_classic_grad_slurm_sync(algo, local_comm=algo.local_comm)
-        algo._round_start()
-
-        self.assertEqual(calls, ["base"])
-        algo._BaseAlgorithm__local_optimizer.zero_grad.assert_called_once()
+        install_round_end_eval(algo, local_comm=mock.Mock())
+        algo._round_end()
+        self.assertEqual(calls, ["eval", "base"])
 
 
 if __name__ == "__main__":

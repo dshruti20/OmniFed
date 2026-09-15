@@ -7,6 +7,9 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+# Frozen contract: one srun, 1 GPU = 1 client.
+SLURM_WORKER_MODULE = "src.omnifed.slurm_worker"
+
 
 def _inside_slurm() -> bool:
     return "SLURM_JOB_ID" in os.environ
@@ -15,6 +18,56 @@ def _inside_slurm() -> bool:
 def resolve_slurm_frozen_cfg_path(hydra_output_dir: str) -> str:
     """Absolute path to per-run ``engine_frozen.json`` (under the Hydra run directory)."""
     return os.path.abspath(os.path.join(hydra_output_dir, "engine_frozen.json"))
+
+
+def tasks_per_allocated_node(
+    worker_ntasks: int, nodes: int, ntasks_per_node: int
+) -> List[int]:
+    """How many worker ranks sit on each allocated node, rank 0 first.
+
+    Packing A (7×1): ``[1, 1, 1, 1, 1, 1, 1]``.
+    Packing B (2 nodes, 6 GPUs on the second): ``[1, 6]`` so the gRPC
+    **server** is alone on node 0 and trainers are ``SLURM_LOCALID`` 0..5
+    on node 1. Not hardcoded 7: yaml ``nodes`` / ``ntasks_per_node`` plus
+    Engine ``worker_ntasks = len(topology)``.
+    """
+    worker_ntasks = int(worker_ntasks)
+    nodes = int(nodes)
+    ntasks_per_node = int(ntasks_per_node)
+    if worker_ntasks < 1 or nodes < 1 or ntasks_per_node < 1:
+        raise ValueError(
+            f"worker_ntasks={worker_ntasks}, nodes={nodes}, "
+            f"ntasks_per_node={ntasks_per_node} must all be >= 1"
+        )
+    rest = nodes - 1
+    first = worker_ntasks - rest * ntasks_per_node
+    if first < 1:
+        raise ValueError(
+            "Rank 0 (gRPC server) needs at least one task on the first node. "
+            f"Got worker_ntasks={worker_ntasks}, nodes={nodes}, "
+            f"ntasks_per_node={ntasks_per_node}."
+        )
+    if first > ntasks_per_node:
+        raise ValueError(
+            f"First node would need {first} tasks but ntasks_per_node="
+            f"{ntasks_per_node}. Raise slurm.nodes or slurm.ntasks_per_node."
+        )
+    counts = [first] + [ntasks_per_node] * rest
+    if sum(counts) != worker_ntasks:
+        raise ValueError(
+            f"placement {counts} does not sum to worker_ntasks={worker_ntasks}"
+        )
+    return counts
+
+
+def allocation_slot_count(worker_ntasks: int, nodes: int, ntasks_per_node: int) -> int:
+    """SBATCH ``--ntasks`` so every node has ``ntasks_per_node`` slots.
+
+    Packing B needs 6 slots on *both* nodes (12) even though only 7 worker
+    ranks run; otherwise Slurm packs 6+1 with rank 0 on the GPU node.
+    """
+    tasks_per_allocated_node(worker_ntasks, nodes, ntasks_per_node)
+    return int(nodes) * int(ntasks_per_node)
 
 
 @dataclass
@@ -28,7 +81,6 @@ class SlurmConfig:
     ntasks_per_node: int = 1
     cpus_per_task: int = 8
 
-    # GPU options
     gres: Optional[str] = None
     gpus_per_node: int = 0
     gpus_per_task: Optional[int] = None
@@ -48,10 +100,8 @@ class SlurmConfig:
     preempt_notice_sec: int = 180
     resume_from: Optional[str] = None
 
-    # launcher will set this so Slurm world size == topology size
     ntasks: Optional[int] = None
 
-    # runtime fields (set by Engine)
     work_dir: Optional[str] = None
     cfg_json_path: Optional[str] = None
     pyexe: Optional[str] = None
@@ -69,7 +119,10 @@ class SlurmConfig:
         ]
 
         if self.ntasks:
-            lines.append(f"#SBATCH --ntasks={self.ntasks}")
+            alloc = allocation_slot_count(
+                int(self.ntasks), int(self.nodes), int(self.ntasks_per_node)
+            )
+            lines.append(f"#SBATCH --ntasks={alloc}")
         if self.account:
             lines.append(f"#SBATCH --account={self.account}")
         if self.partition:
@@ -91,7 +144,6 @@ class SlurmConfig:
         if self.work_dir:
             lines.append(f"#SBATCH --chdir={self.work_dir}")
 
-        # GPU request section
         if self.gres:
             lines.append(f"#SBATCH --gres={self.gres}")
         elif self.gpus_per_node and self.gpus_per_node > 0:
@@ -103,10 +155,107 @@ class SlurmConfig:
         return lines
 
 
+def build_sbatch_script(sconf: SlurmConfig, *, pyexe: str) -> str:
+    """Build the sbatch body. Worker entrypoint is ``SLURM_WORKER_MODULE``."""
+    assert sconf.work_dir and sconf.cfg_json_path, "work_dir and cfg_json_path must be set"
+
+    with open(sconf.cfg_json_path, "rb") as f:
+        payload_b64 = base64.b64encode(f.read()).decode("ascii")
+
+    cfg_dir = os.path.dirname(sconf.cfg_json_path)
+    repo_root = sconf.work_dir
+
+    lines: List[str] = ["#!/bin/bash"]
+    lines += sconf.sbatch_lines()
+    lines += [
+        "set -euo pipefail",
+        f'export PYTHONPATH="${{PYTHONPATH:-}}:{repo_root}"',
+        "export PYTHONUNBUFFERED=1",
+        "export HYDRA_FULL_ERROR=1",
+        "export OMNIFED_DEBUG=${OMNIFED_DEBUG:-0}",
+        "",
+    ]
+
+    if sconf.setup_lines:
+        lines += sconf.setup_lines + [""]
+
+    lines += [
+        'echo "SLURM_JOB_ID=$SLURM_JOB_ID"',
+        'echo "SLURM_NODELIST=$SLURM_NODELIST"',
+        'echo "Running on $(hostname)"',
+        'echo "PYTHONPATH=$PYTHONPATH"',
+        f'echo "Requested PYEXE={pyexe}"',
+        "",
+        f'srun -N "$SLURM_JOB_NUM_NODES" -n "$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 bash -lc {shlex.quote(f"mkdir -p {cfg_dir}")}',
+        "",
+        f'export OMNIFED_CFG_B64="{payload_b64}"',
+        "srun -N \"$SLURM_JOB_NUM_NODES\" -n \"$SLURM_JOB_NUM_NODES\" --ntasks-per-node=1 bash -lc "
+        + shlex.quote(f'echo "$OMNIFED_CFG_B64" | base64 -d > {sconf.cfg_json_path}'),
+        "srun -N \"$SLURM_JOB_NUM_NODES\" -n \"$SLURM_JOB_NUM_NODES\" --ntasks-per-node=1 bash -lc "
+        + shlex.quote(
+            f'echo "[$(hostname)] wrote {sconf.cfg_json_path}; size=$(stat -c%s {sconf.cfg_json_path}) bytes"'
+        ),
+        "",
+    ]
+
+    worker_cmd = (
+        'if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then '
+        'export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"; '
+        "fi; "
+        "unset ROCR_VISIBLE_DEVICES; "
+        'echo "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-<unset>}"; '
+        'echo "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-<unset>}"; '
+        'echo "Using worker python: ${PYEXE:-' + pyexe + '}"; '
+        'echo "SLURM_PROCID=${SLURM_PROCID:-?} SLURM_LOCALID=${SLURM_LOCALID:-?} '
+        'SLURM_NTASKS=${SLURM_NTASKS:-?} host=$(hostname)"; '
+        "${PYEXE:-" + pyexe + "} -u -m " + SLURM_WORKER_MODULE + " "
+        "--cfg-json " + shlex.quote(sconf.cfg_json_path)
+    )
+    worker_srun = "srun --export=ALL bash -lc " + shlex.quote(worker_cmd)
+    if sconf.ntasks:
+        worker_n = int(sconf.ntasks)
+        counts = tasks_per_allocated_node(
+            worker_n, int(sconf.nodes), int(sconf.ntasks_per_node)
+        )
+        hostfile_path = os.path.join(cfg_dir, "slurm_rank_hosts")
+        counts_bash = " ".join(str(c) for c in counts)
+        lines += [
+            f"WORKER_NTASKS={worker_n}",
+            f"COUNTS=({counts_bash})",
+            'mapfile -t HOSTS < <(scontrol show hostnames "$SLURM_NODELIST")',
+            'echo "SLURM hosts: ${HOSTS[*]}"',
+            'if [ "${#HOSTS[@]}" -ne "${#COUNTS[@]}" ]; then',
+            '  echo "[omnifed] host count ${#HOSTS[@]} != placement ${#COUNTS[@]}" >&2',
+            '  exit 1',
+            "fi",
+            f"RANK_HOSTFILE={shlex.quote(hostfile_path)}",
+            ': > "$RANK_HOSTFILE"',
+            'for i in "${!COUNTS[@]}"; do',
+            "  for ((k=0; k<COUNTS[i]; k++)); do",
+            '    echo "${HOSTS[i]}" >> "$RANK_HOSTFILE"',
+            "  done",
+            "done",
+            'echo "=== rank hostfile (rank 0 = gRPC server node) ==="',
+            'nl -ba "$RANK_HOSTFILE"',
+            "",
+        ]
+        worker_srun = (
+            f'srun --ntasks="{worker_n}" --distribution=arbitrary '
+            '--hostfile="$RANK_HOSTFILE" --export=ALL bash -lc '
+            + shlex.quote(worker_cmd)
+        )
+
+    lines += [
+        "set -x",
+        worker_srun,
+        "set +x",
+    ]
+
+    return "\n".join(lines) + "\n"
+
+
 class SlurmOnlyLauncher:
-    """
-    Submit sbatch from outside Slurm; inside allocation the worker module drives the run.
-    """
+    """One srun: each Slurm task is one OmniFed node (1 GPU per client)."""
 
     @staticmethod
     def submit_or_exit(sconf: SlurmConfig) -> None:
@@ -114,66 +263,7 @@ class SlurmOnlyLauncher:
         assert sconf.work_dir and sconf.cfg_json_path, "work_dir and cfg_json_path must be set"
 
         pyexe = sconf.pyexe or os.getenv("PYEXE") or "python"
-
-        # Read JSON and base64-encode so we can broadcast to all nodes without scp
-        with open(sconf.cfg_json_path, "rb") as f:
-            payload_b64 = base64.b64encode(f.read()).decode("ascii")
-
-        cfg_dir = os.path.dirname(sconf.cfg_json_path)
-
-        # Compute project root (directory that contains "src")
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-        lines: List[str] = ["#!/bin/bash"]
-        lines += sconf.sbatch_lines()
-        lines += [
-            "set -euo pipefail",
-            f'export PYTHONPATH="${{PYTHONPATH:-}}:{repo_root}"',
-            'export PYTHONUNBUFFERED=1',
-            'export HYDRA_FULL_ERROR=1',
-            'export OMNIFED_DEBUG=${OMNIFED_DEBUG:-0}',
-            "",
-        ]
-
-        if sconf.setup_lines:
-            lines += sconf.setup_lines + [""]
-
-        lines += [
-            'echo "SLURM_JOB_ID=$SLURM_JOB_ID"',
-            'echo "SLURM_NODELIST=$SLURM_NODELIST"',
-            'echo "Running on $(hostname)"',
-            'echo "PYTHONPATH=$PYTHONPATH"',
-            f'echo "Requested PYEXE={pyexe}"',
-            "",
-            # Ensure the JSON directory exists on every node
-            f'srun -N "$SLURM_JOB_NUM_NODES" -n "$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 bash -lc {shlex.quote(f"mkdir -p {cfg_dir}")}',
-            "",
-            # Write identical JSON file on each node by decoding embedded base64
-            f'export OMNIFED_CFG_B64="{payload_b64}"',
-            'srun -N "$SLURM_JOB_NUM_NODES" -n "$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 bash -lc ' +
-            shlex.quote(f'echo "$OMNIFED_CFG_B64" | base64 -d > {sconf.cfg_json_path}'),
-            'srun -N "$SLURM_JOB_NUM_NODES" -n "$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 bash -lc ' +
-            shlex.quote(
-                f'echo "[$(hostname)] wrote {sconf.cfg_json_path}; size=$(stat -c%s {sconf.cfg_json_path}) bytes"'
-            ),
-            "",
-            # Frontier / AMD fix for Ray import path
-            "set -x",
-            "srun --export=ALL bash -lc " + shlex.quote(
-                'if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then '
-                'export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"; '
-                'fi; '
-                'unset ROCR_VISIBLE_DEVICES; '
-                'echo "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-<unset>}"; '
-                'echo "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-<unset>}"; '
-                'echo "Using worker python: ${PYEXE:-' + pyexe + '}"; '
-                '${PYEXE:-' + pyexe + '} -u -m src.omnifed.slurm_worker '
-                '--cfg-json ' + shlex.quote(sconf.cfg_json_path)
-            ),
-            "set +x",
-        ]
-
-        script = "\n".join(lines) + "\n"
+        script = build_sbatch_script(sconf, pyexe=pyexe)
 
         path = os.path.join(sconf.work_dir, "omnifed_slurm_only.sh")
         with open(path, "w") as f:

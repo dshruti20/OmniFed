@@ -65,6 +65,7 @@ class TestTorchDistCompressionAggregate(unittest.TestCase):
             compressor=TopKCompression(device="cpu", compress_ratio=0.5),
         )
         comm.set_aggregation_num_samples(0)
+        comm.set_aggregation_compress(False)
         t = torch.tensor([1.0, 2.0])
         with mock.patch(
             "src.omnifed.communicator.torchdist.dist.all_reduce",
@@ -82,12 +83,13 @@ class TestTorchDistCompressionAggregate(unittest.TestCase):
             communicate_params=False,
             compressor=TopKCompression(device="cpu", compress_ratio=0.5),
         )
-        comm.set_aggregation_num_samples(8)
+        comm.set_aggregation_compress(True)
         model = nn.Linear(4, 1, bias=False)
         model.weight.grad = torch.tensor([[4.0, 0.0, -1.0, 2.0]])
 
-        with mock.patch(
-            "src.omnifed.communicator.torchdist.aggregate_topk_tensor",
+        with mock.patch.object(
+            TopKCompression,
+            "aggregate_torchdist",
             return_value=torch.ones(1, 4),
         ) as mock_topk:
             comm.aggregate(model, AggregationOp.SUM)
@@ -102,12 +104,13 @@ class TestTorchDistCompressionAggregate(unittest.TestCase):
             communicate_params=True,
             compressor=TopKCompression(device="cpu", compress_ratio=0.5),
         )
-        comm.set_aggregation_num_samples(8)
+        comm.set_aggregation_compress(True)
         model = nn.Linear(4, 1, bias=False)
         model.weight.data.copy_(torch.tensor([[1.0, 2.0, 3.0, 4.0]]))
 
-        with mock.patch(
-            "src.omnifed.communicator.torchdist.aggregate_topk_tensor",
+        with mock.patch.object(
+            TopKCompression,
+            "aggregate_torchdist",
             return_value=torch.full((1, 4), 0.5),
         ) as mock_topk:
             comm.aggregate(model, AggregationOp.SUM)
@@ -140,6 +143,33 @@ class TestTorchDistCompressionAggregate(unittest.TestCase):
             )
         torch.testing.assert_close(out, local * 2.0)
 
+    def test_dense_all_reduce_does_not_record_pack_or_rpc(self) -> None:
+        comm = TorchDistCommunicator(
+            rank=0,
+            world_size=2,
+            master_port=29613,
+            communicate_params=False,
+        )
+        logger = SimpleNamespace(
+            _summary_iter_comm={
+                "grpc_upstream_s": 0.0,
+                "grpc_downstream_s": 0.0,
+                "grpc_pack_s": 0.0,
+                "grpc_unpack_s": 0.0,
+            }
+        )
+        comm.set_logger(logger)
+        t = torch.tensor([1.0, 2.0])
+        with mock.patch(
+            "src.omnifed.communicator.torchdist.dist.all_reduce",
+            side_effect=lambda tensor, **kw: tensor.mul_(2.0),
+        ):
+            comm.aggregate(t, AggregationOp.SUM)
+        self.assertEqual(logger._summary_iter_comm["grpc_upstream_s"], 0.0)
+        self.assertEqual(logger._summary_iter_comm["grpc_downstream_s"], 0.0)
+        self.assertEqual(logger._summary_iter_comm["grpc_pack_s"], 0.0)
+        self.assertEqual(logger._summary_iter_comm["grpc_unpack_s"], 0.0)
+
     def test_compress_decompress_timings_recorded(self) -> None:
         compressor = TopKCompression(device="cpu", compress_ratio=0.5)
         logger = SimpleNamespace(_summary_iter_comm={})
@@ -159,9 +189,9 @@ class TestTorchDistCompressionAggregate(unittest.TestCase):
                 logger=logger,
             )
 
-        self.assertIn("grpc_compress_s", logger._summary_iter_comm)
-        self.assertIn("grpc_decompress_s", logger._summary_iter_comm)
-        self.assertGreater(logger._summary_iter_comm["grpc_compress_s"], 0.0)
+        self.assertIn("grpc_pack_s", logger._summary_iter_comm)
+        self.assertIn("grpc_unpack_s", logger._summary_iter_comm)
+        self.assertGreater(logger._summary_iter_comm["grpc_pack_s"], 0.0)
 
 
 if __name__ == "__main__":
