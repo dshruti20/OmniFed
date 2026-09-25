@@ -79,7 +79,7 @@ class SlurmConfig:
     time: str = "02:00:00"
     nodes: int = 2
     ntasks_per_node: int = 1
-    cpus_per_task: int = 8
+    cpus_per_task: int = 6
 
     gres: Optional[str] = None
     gpus_per_node: int = 0
@@ -237,12 +237,14 @@ def build_sbatch_script(sconf: SlurmConfig, *, pyexe: str) -> str:
             "done",
             'echo "=== rank hostfile (rank 0 = gRPC server node) ==="',
             'nl -ba "$RANK_HOSTFILE"',
+
             "",
         ]
         worker_srun = (
-            f'srun --ntasks="{worker_n}" --distribution=arbitrary '
-            '--hostfile="$RANK_HOSTFILE" --export=ALL bash -lc '
-            + shlex.quote(worker_cmd)
+          "export SLURM_HOSTFILE=\"$RANK_HOSTFILE\" && "
+          f'srun --ntasks="{worker_n}" --distribution=arbitrary '
+          "--export=ALL bash -lc "
+          + shlex.quote(worker_cmd)
         )
 
     lines += [
